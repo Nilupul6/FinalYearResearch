@@ -1,0 +1,185 @@
+# Install required libraries
+!pip install -q openai transformers sentence-transformers datasets pandas tqdm requests
+
+import os
+import pandas as pd
+import torch
+import requests
+import openai
+from transformers import pipeline
+from sentence_transformers import SentenceTransformer, util
+from datasets import Dataset
+from tqdm import tqdm
+import time
+from openai import OpenAI
+import requests
+
+
+class ProductRecommender:
+    def __init__(self, dataset_path, max_dataset_size=10000, chunk_size=1000, top_n=10):
+        self.device = 0 if torch.cuda.is_available() else -1
+        print(f"Using device: {'GPU' if self.device == 0 else 'CPU'}")
+        self.chunk_size = chunk_size
+        self.top_n = top_n
+        self.max_dataset_size = max_dataset_size
+
+        # Load models
+        self.absa_pipe = pipeline(
+            "text-classification",
+            model="yangheng/deberta-v3-large-absa-v1.1",
+            tokenizer="yangheng/deberta-v3-large-absa-v1.1",
+            device=self.device
+        )
+        self.sbert = SentenceTransformer('all-MiniLM-L6-v2', device=self.device)
+
+        # Load and preprocess dataset
+        self.df = self._load_and_preprocess_dataset(dataset_path)
+
+    def _load_and_preprocess_dataset(self, dataset_path):
+        df = pd.read_csv(dataset_path)
+        df = df.dropna(subset=['review_text', 'product_title'])
+        df = df.reset_index(drop=True)
+
+        # Sample and filter
+        df = df.sample(n=min(self.max_dataset_size, len(df)), random_state=42)
+        df = df.groupby('product_title').apply(lambda x: x.head(5)).reset_index(drop=True)
+        df = df[df['review_text'].str.len() > 15]
+
+        # ABSA Extraction
+        dataset = Dataset.from_pandas(df)
+        def extract_aspects(batch):
+            results = self.absa_pipe(batch['review_text'], batch_size=2)
+            aspects = [r['label'].split("#[SEP]")[0].strip() for r in results]
+            sentiments = [r['label'].split("#[SEP]")[-1].strip() for r in results]
+            return {"aspect": aspects, "aspect_sentiment": sentiments}
+
+        print("🔁 Running ABSA...")
+        start_time = time.time()
+        dataset = dataset.map(extract_aspects, batched=True, batch_size=2)
+        df = dataset.to_pandas()
+        print(f"✅ ABSA completed in {time.time() - start_time:.2f} seconds")
+
+        return df
+
+    def _infer_product_category(self, user_input):
+        query_embedding = self.sbert.encode(user_input, convert_to_tensor=True)
+        product_titles = self.df['product_title'].unique().tolist()
+        top_title = None
+        max_score = -1
+
+        for i in range(0, len(product_titles), self.chunk_size):
+            chunk_titles = product_titles[i:i+self.chunk_size]
+            title_embeddings = self.sbert.encode(chunk_titles, convert_to_tensor=True)
+            cos_scores = util.pytorch_cos_sim(query_embedding, title_embeddings).squeeze()
+            chunk_max_score, chunk_max_idx = torch.max(cos_scores, dim=0)
+            if chunk_max_score > max_score:
+                max_score = chunk_max_score
+                top_title = chunk_titles[chunk_max_idx]
+
+        return top_title.split()[0].lower() if top_title else "product"
+
+    
+
+    def _generate_complementary_products(self, category):
+      url = "https://openrouter.ai/api/v1/chat/completions"
+      headers = {
+          "Authorization": "Bearer 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",  # Replace this
+          "Content-Type": "application/json",
+          "HTTP-Referer": "https://yourdomain.com",  
+          "X-Title": "Product-Recommender"
+      }
+      data = {
+          "model": "deepseek/deepseek-r1:free",  
+          "messages": [
+              {
+                  "role": "user",
+                  "content": f"List 3 complementary products for a {category} in a comma-separated format only."
+              }
+          ],
+      }
+
+      try:
+          response = requests.post(url, headers=headers, json=data)
+          response.raise_for_status()
+          result = response.json()
+          reply = result['choices'][0]['message']['content']
+          return [item.strip() for item in reply.split(",") if item.strip()]
+      except Exception as e:
+          print(f"⚠️ OpenRouter/DeepSeek API error: {e}. Falling back to generic accessory.")
+          return ["accessory"]
+
+
+    def recommend(self, user_review):
+        absa_result = self.absa_pipe(user_review)[0]['label']
+        parts = absa_result.split("#[SEP]")
+        user_aspect = parts[0].strip().lower() if len(parts) == 2 else "quality"
+        user_sentiment = parts[1].strip().lower() if len(parts) == 2 else "positive"
+        target_sentiment = "positive" if user_sentiment == "negative" else "positive"
+
+        print(f"🔍 Aspect: {user_aspect}, Sentiment: {user_sentiment} ➜ Target: {target_sentiment}")
+
+        # Infer category
+        user_category = self._infer_product_category(user_review)
+        print(f"🔍 Inferred Product Category: {user_category}")
+
+        # Generate complementary products via ChatGPT-4
+        complementary_products = self._generate_complementary_products(user_category)
+        print(f"🔍 Dynamically Generated Complementary Products: {', '.join(complementary_products)}")
+
+        # Search matching products
+        product_titles = self.df['product_title'].unique().tolist()
+        similar_products = []
+        for i in range(0, len(product_titles), self.chunk_size):
+            chunk_titles = product_titles[i:i+self.chunk_size]
+            title_embeddings = self.sbert.encode(chunk_titles, convert_to_tensor=True)
+            query_embedding = self.sbert.encode(" ".join(complementary_products), convert_to_tensor=True)
+            cos_scores = util.pytorch_cos_sim(query_embedding, title_embeddings).squeeze()
+            top_indices = torch.topk(cos_scores, k=min(25, len(chunk_titles))).indices.tolist()
+            similar_products.extend([chunk_titles[j] for j in top_indices])
+
+        # Filter dataset
+        filtered_df = self.df[
+            (self.df['product_title'].isin(similar_products)) &
+            (self.df['aspect_sentiment'].str.lower() == target_sentiment)
+        ]
+
+        if filtered_df.empty:
+            print("⚠️ No complementary products found. Falling back to positive reviews.")
+            filtered_df = self.df[self.df['aspect_sentiment'].str.lower() == "positive"]
+
+        filtered_df = filtered_df.copy()
+        filtered_df['combo_text'] = filtered_df['product_title'] + ": " + filtered_df['review_text']
+
+        similarity_scores = []
+        for i in range(0, len(filtered_df), self.chunk_size):
+            chunk_texts = filtered_df['combo_text'].iloc[i:i+self.chunk_size].tolist()
+            combo_embeddings = self.sbert.encode(chunk_texts, convert_to_tensor=True)
+            user_embedding = self.sbert.encode(user_review, convert_to_tensor=True)
+            chunk_scores = util.pytorch_cos_sim(user_embedding, combo_embeddings).squeeze()
+            similarity_scores.extend(chunk_scores.tolist())
+
+        filtered_df['similarity'] = similarity_scores
+
+        recommendations = (
+            filtered_df.sort_values(by='similarity', ascending=False)
+            .drop_duplicates(subset='product_title')
+            .head(self.top_n)
+        )
+
+        return recommendations[['product_title', 'review_text', 'aspect', 'aspect_sentiment', 'similarity']]
+
+
+# Usage
+if __name__ == "__main__":
+    recommender = ProductRecommender(
+        dataset_path='/content/drive/MyDrive/ecommerce_product_reviews_dataset.csv',
+        max_dataset_size=10000,
+        chunk_size=1000,
+        top_n=10
+    )
+
+    user_review = "it is a good book"
+    recommendations = recommender.recommend(user_review)
+
+    print(f"\n✅ Top {recommender.top_n} Complementary Product Recommendations:")
+    print(recommendations)

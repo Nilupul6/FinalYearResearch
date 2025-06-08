@@ -1,0 +1,68 @@
+# 📦 Step 1: Install Required Packages
+!pip install -q transformers sentence-transformers pandas tqdm
+
+# 📚 Step 2: Import Libraries
+import pandas as pd
+from transformers import pipeline
+from sentence_transformers import SentenceTransformer, util
+import torch
+from tqdm import tqdm
+from google.colab import files
+
+# ⚙️ Step 3: Upload and Load Review Dataset from Local
+uploaded = files.upload()
+filename = list(uploaded.keys())[0]
+df = pd.read_csv(filename)
+df = df.dropna(subset=['review_text'])
+df = df.reset_index(drop=True)
+if '__index_level_0__' in df.columns:
+    df = df.drop(columns='__index_level_0__')
+
+# ⚠️ Optional: Use a smaller sample for fast experimentation
+df = df.sample(n=min(10000, len(df)), random_state=42)
+# 🤖 Step 4: Load Pretrained Models with GPU
+absa_pipe = pipeline(
+    "text-classification",
+    model="yangheng/deberta-v3-base-absa-v1.1",
+    tokenizer="yangheng/deberta-v3-base-absa-v1.1",
+    device=0  # Use GPU if available
+)
+sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# 🧠 Step 5: Use HuggingFace Dataset + Batch Aspect Sentiment Analysis
+start_time = time.time()
+dataset = Dataset.from_pandas(df)
+
+def extract_aspects(batch):
+    results = absa_pipe(batch['review_text'], batch_size=8)
+    aspects = [r['label'].split("#[SEP]")[0].strip() for r in results]
+    sentiments = [r['label'].split("#[SEP]")[-1].strip() for r in results]
+    return {"aspect": aspects, "aspect_sentiment": sentiments}
+
+dataset = dataset.map(extract_aspects, batched=True, batch_size=8)
+df = dataset.to_pandas()
+print(f"✅ ABSA processing completed in {time.time() - start_time:.2f} seconds")
+# 🛍 Step 6: User Query + Recommendation
+user_review = "I love the camera on this phone. Photos are crystal clear even in low light."
+user_embedding = sbert_model.encode(user_review, convert_to_tensor=True)
+
+# Combine review_text + product title for better match
+df['combo_text'] = df['product_title'] + ": " + df['review_text']
+combo_embeddings = sbert_model.encode(
+    df['combo_text'].tolist(),
+    convert_to_tensor=True,
+    batch_size=64,
+    show_progress_bar=True
+)
+df['similarity'] = util.pytorch_cos_sim(user_embedding, combo_embeddings).squeeze().tolist()
+
+# 🌟 Step 7: Recommend Top 10 Unique Products
+top_n = 10
+recommendations = (
+    df.sort_values(by='similarity', ascending=False)
+      .drop_duplicates(subset='product_title')  # Keep only first (most similar) per product
+      .head(top_n)
+)
+
+print(f"\n✅ Top {top_n} Recommended Products:")
+print(recommendations[['product_title', 'review_text', 'aspect', 'aspect_sentiment', 'similarity']])
